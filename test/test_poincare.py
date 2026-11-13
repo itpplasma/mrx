@@ -6,9 +6,12 @@ logical surfaces and wind with the rotational transform of the file. The traced 
 matches ``|iota(r)|`` of the file at the line's radius within a measured band, the discretisation error of the
 field, and halving the step moves the lines by less than a measured drift.
 """
+import jax
+import jax.extend
+import jax.numpy as jnp
 import numpy as np
 
-from mrx.diagnostics.poincare import poincare
+from mrx.diagnostics.poincare import logical_field, poincare, trace
 
 #: 1.25x ``max |iota_traced - |iota_file|| / max |iota_file|`` on li383 (16, 32, 12) p=2, 8 lines over 60 periods,
 #: measured 1.06e-3 (2026-10-20). A tracer that missed the factor nfp or a wrong winding would be off by O(1).
@@ -29,3 +32,25 @@ def test_traced_iota_is_the_file_iota(seq, b0):
     assert shown.all()                  # the field is integrable: no line is chaotic or leaves the domain
     assert err < IOTA_BAND
     assert float(res["drift"]) < DRIFT_BAND
+
+
+def _primitives(jaxpr, inside_scan=False, found=None):
+    """The names of the primitives of ``jaxpr`` that run inside a ``scan``, the step loop of the tracer."""
+    found = set() if found is None else found
+    for eqn in jaxpr.eqns:
+        if inside_scan:
+            found.add(eqn.primitive.name)
+        for sub in jax.extend.core.jaxprs_in_params(eqn.params):
+            _primitives(sub, inside_scan or eqn.primitive.name == "scan", found)
+    return found
+
+
+def test_trace_applies_the_extraction_once(seq, b0):
+    """The step loop of the tracer only evaluates the splines: the extraction ``E^T dof``, a scatter-add over
+    all DoFs, runs once before it. The lines are those of the per-step extraction to round-off."""
+    field, seeds = logical_field(seq), jnp.array([[0.3, 0.0], [0.6, 0.25], [0.9, 0.5]])
+    loop = _primitives(jax.make_jaxpr(lambda d: trace(field, d, seeds, 2, 300))(b0).jaxpr)
+    assert "scatter-add" not in loop, sorted(loop)
+    ys = trace(field, b0, seeds, 2, 300)
+    per_step = trace(lambda x, d: field(x, d), b0, seeds, 2, 300)
+    assert float(jnp.max(jnp.abs(ys - per_step))) < 1e-12

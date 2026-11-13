@@ -69,13 +69,28 @@ def logical_field(seq):
     return _logical_field(seq.odd)      # cached per view. set_geometry keeps the views
 
 
+class _LogicalField:
+    """``field(x, dof)`` is the 2-form with the DoFs ``dof`` at ``x``. :func:`trace` splits it into
+    :meth:`coefficients`, applied once per trace, and :meth:`at`, applied at every step."""
+
+    def __init__(self, basis, extraction):
+        self.basis, self.extraction = basis, extraction
+
+    def coefficients(self, dof):
+        """The spline coefficient grids ``E^T dof``."""
+        return self.basis.raw_blocks(self.extraction.T @ dof)
+
+    def at(self, x, coefficients):
+        """The field at ``x`` from the grids returned by :meth:`coefficients`."""
+        return self.basis.contract(coefficients, x)
+
+    def __call__(self, x, dof):
+        return DiscreteFunction(dof, self.basis, self.extraction)(x)
+
+
 @lru_cache(maxsize=None)
 def _logical_field(odd):
-    basis, extraction = odd.basis_2, odd.E(2)
-
-    def field(x, dof):
-        return DiscreteFunction(dof, basis, extraction)(x)
-    return field
+    return _LogicalField(odd.basis_2, odd.E(2))
 
 
 @partial(jax.jit, static_argnames=("field",))
@@ -165,11 +180,15 @@ def trace(field, dof, seeds, n_periods, steps_per_period):
 
     Returns the ``(u, v)`` position after every step, shape ``(n_seeds, n_periods * steps_per_period + 1, 2)``.
     Changing ``n_periods`` or ``steps_per_period`` compiles a new tracer."""
-    rhs = cross_section_rhs(field)
+    # XLA does not hoist the extraction E^T dof out of the step loop, so it is applied here once
+    if isinstance(field, _LogicalField):
+        rhs, args = cross_section_rhs(field.at), field.coefficients(dof)
+    else:
+        rhs, args = cross_section_rhs(field), dof
     h = 1.0 / steps_per_period
 
     def step(y, i):
-        y = _tsit5_step(rhs, i / steps_per_period, y, h, dof)
+        y = _tsit5_step(rhs, i / steps_per_period, y, h, args)
         return y, y
 
     def one(y0):
